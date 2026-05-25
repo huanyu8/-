@@ -11,6 +11,8 @@ editor: source
 原始数据来自 GEO: [GSE267764](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE267764)  
 本地数据路径：`E:/华农研/课程文件/数据驱动的可重复性研究/项目复现-结课/单细胞数据处理/复现文件/GSE267764_RAW`
 
+
+第一段
 ```{r}
 # 设置数据目录（请根据实际位置修改）
 data_dir <- "E:/华农研/课程文件/数据驱动的可重复性研究/项目复现-结课/单细胞数据处理/复现文件/GSE267764_RAW"
@@ -34,6 +36,7 @@ lapply(unique(samples), function(x) {
 ```
 
 
+第二段
 ```{r}
 library(Seurat)
 library(ggplot2)
@@ -72,7 +75,7 @@ table(scRNAseq_cortex$orig.ident)
 ```
 
 
-
+第三段
 ```{r}
 library(harmony)
 
@@ -108,6 +111,8 @@ DimPlot(scRNAseq_cortex, label = TRUE)
 ```
 
 
+
+第四段
 ```{r}
 # 定义映射关系
 cluster_celltype <- c(
@@ -125,11 +130,14 @@ cluster_celltype <- c(
 
 scRNAseq_cortex$cell_type <- unname(cluster_celltype[as.character(scRNAseq_cortex$seurat_clusters)])
 
-# 自定义颜色
-cols <- c("dodgerblue2", "skyblue2", "green4", "#6A3D9A", "black", "#FF7F00", "#E31A1C", "#FB9A99")
+# 自定义颜色（9种细胞类型各一色）
+cols <- c("dodgerblue2", "skyblue2", "green4", "#6A3D9A", "black", "#FF7F00", "#E31A1C", "#FB9A99", "#CAB2D6")
 DimPlot(scRNAseq_cortex, group.by = 'cell_type', cols = cols)
 ```
 
+
+
+第五段
 ```{r}
 # 确保 condition 列存在
 if(!"condition" %in% colnames(scRNAseq_cortex@meta.data)){
@@ -204,6 +212,7 @@ DimPlot(sc_sub_simple, group.by = df_colname, reduction = "umap", label = TRUE) 
 
 
 
+第六段
 ```{r}
 library(tibble)   # 用于 rownames_to_column
 
@@ -254,7 +263,7 @@ head(combined_DGE_filter)
 ```
 
 
-
+第七段
 ```{r}
 library(ggrepel)
 
