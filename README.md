@@ -70,11 +70,11 @@ https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE267764
 # 小组信息
 | 成员 | 学号 | 分工 |github|
 |---|---|---|---|
-| 邹林 | 2025303110139 | 合适论文寻找、初始框架建立、README 编写 | @huanyu8 |
-| 林观清 | 2025303120114 | 论文图复现 | @LGQ559492 |
-| 郑永琪 | 2025303120147 | 论文图复现 |@zcguksjv65 |
-| 李迁 | 2025303120110 | 论文图复现 |
-| 黄子凯 | 2025303110141 | 项目整理、Quarto 文档转换、最终提交 | @hirasauayui |
+| 邹林 | 2025303110139 | 合适论文寻找、初始框架建立、README 编写 | [@huanyu8](https://github.com/huanyu8) |
+| 林观清 | 2025303120114 | 论文图复现 | [@LGQ559492](https://github.com/LGQ559492) |
+| 郑永琪 | 2025303120147 | 论文图复现 | [@zcguksjv65](https://github.com/zcguksjv65)  |
+| 李迁 | 2025303120110 | 论文图复现 |[li20010229-eng](https://github.com/li20010229-eng)
+| 黄子凯 | 2025303110141 | 项目整理、Quarto 文档转换、最终提交 |[@hirasauayui](https://github.com/hirasauayui) |
 
 ---
 
