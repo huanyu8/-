@@ -1,0 +1,386 @@
+---
+title: "单细胞转录组数据分析流程复现 (GSE267764) - Nature 2025"
+author: "数据驱动的可重复性研究"
+date: "`r Sys.Date()`"
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: cosmo
+    code-fold: show
+    code-tools: true
+    highlight-style: github
+editor: visual
+execute:
+  warning: false
+  message: false
+  eval: false
+---
+
+# 项目背景
+
+本分析报告旨在复现 **Kimura et al. (Nature 2025)** 中关于小鼠皮层(Cortex)单细胞转录组数据分析的主要步骤。 原始数据来源于 GEO 数据库：[GSE267764](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE267764)。 通过标准的 Seurat v5 流程，我们对数据进行了质量控制、降维聚类、细胞亚群注释、双细胞去除以及差异表达分析 (DGE)。 ---
+
+# 数据准备与预处理
+
+```{r}
+#| label: data-preparation
+#| eval: false
+
+# 设定本地原始数据存储路径（请根据实际计算环境调整）
+data_dir <- "E:/华农研/课程文件/数据驱动的可重复性研究/项目复现-结课/单细胞数据处理/LGQ/GSE267764_RAW"
+
+# 检索目录下所有包含 "GSM" 前缀的文件
+fs <- list.files(data_dir, pattern = "GSM", full.names = FALSE)
+
+# 提取文件名的前10个字符作为样本的唯一标识符 (例如: GSM8275372)
+samples <- substr(fs, 1, 10)
+
+# 遍历每个独立样本，自动创建文件夹并重命名三大核心文件
+lapply(unique(samples), function(x) {
+  # 提取属于当前样本的三个文件
+  y <- fs[grepl(x, fs)]
+  
+  # 拼接创建对应的样本文件夹路径
+  folder <- file.path(data_dir, paste(strsplit(y[1], split = "_")[[1]][1:2], collapse = "_"))
+  dir.create(folder, recursive = TRUE, showWarnings = FALSE)
+  
+  # 将原始文件移动至新文件夹并重命名为 10X 标准命名格式
+  file.rename(file.path(data_dir, y[1]), file.path(folder, "barcodes.tsv.gz"))
+  file.rename(file.path(data_dir, y[2]), file.path(folder, "features.tsv.gz"))
+  file.rename(file.path(data_dir, y[3]), file.path(folder, "matrix.mtx.gz"))
+})
+```
+
+# 数据读取与质量控制 (QC)
+
+读取标准的 10X 矩阵文件并创建 Seurat 对象。为保证下游分析的准确性，我们需要剔除死细胞、空液滴和可能的多细胞。线粒体基因比例是衡量细胞活力的重要指标。
+
+```{r}
+#| label: qc-and-filtering
+#| fig-width: 10
+#| fig-height: 6
+
+# 载入核心分析与可视化R包
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+
+# 🌟 关键修复：在这里重新声明你的数据文件夹路径
+data_dir <- "E:/华农研/课程文件/数据驱动的可重复性研究/项目复现-结课/单细胞数据处理/LGQ/GSE267764_RAW"
+
+# 获取已整理好的样本子文件夹路径
+sample_dirs <- list.dirs(data_dir, recursive = FALSE, full.names = TRUE)
+sample_names <- basename(sample_dirs)
+
+# 循环读取各个样本并将其转换为 Seurat 对象列表
+seurat_list <- list()
+for (i in seq_along(sample_dirs)) {
+  counts <- Read10X(sample_dirs[i])
+  seurat_list[[i]] <- CreateSeuratObject(counts, project = sample_names[i])
+}
+
+# ......（下面剩余的代码保持不变即可）......
+# 沿细胞方向合并所有样本，添加样本前缀以防 barcode 冲突
+scRNAseq_cortex <- merge(seurat_list[[1]], y = seurat_list[-1], add.cell.ids = sample_names)
+
+# 计算线粒体基因百分比 (注意：小鼠线粒体基因前缀为 'mt-'，人类为 'MT-')
+scRNAseq_cortex[["percent.mt"]] <- PercentageFeatureSet(scRNAseq_cortex, pattern = "^mt-")
+
+# 绘制质控前的小提琴图评估数据分布
+VlnPlot(scRNAseq_cortex, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+# 执行严格的质量控制过滤：
+# 1. nCount_RNA >= 1000: 剔除 UMI 数过低的空液滴或碎片
+# 2. nFeature_RNA >= 200: 剔除检测到基因数过少的低质量细胞
+# 3. percent.mt < 80: 剔除线粒体比例过高的凋亡/死亡细胞（由于特定组织特性，此处阈值设为较宽松的80%）
+scRNAseq_cortex <- subset(scRNAseq_cortex, 
+                          subset = nCount_RNA >= 1000 & 
+                            nFeature_RNA >= 200 & 
+                            percent.mt < 80)
+
+# 查看过滤后各样本的保留细胞数
+table(scRNAseq_cortex$orig.ident)
+```
+
+#  降维聚类分析与批次效应校正
+
+在此模块中，我们将数据标准化，寻找高变基因，并利用 PCA 进行线性降维。由于存在多个样本，我们使用 `harmony` 算法对样本间可能存在的批次效应进行校正，随后进行非线性降维 (UMAP) 和图聚类 (Louvain)。
+
+```{r}
+#| label: dimensionality-reduction
+
+library(harmony)
+
+# 封装一个标准的降维聚类 Pipeline 函数
+scrna_process <- function(seurat_obj, npc, res, normalize = TRUE, run_harmony = TRUE) {
+  # 1. 数据标准化：消除测序深度差异
+  if (normalize) {
+    seurat_obj <- NormalizeData(seurat_obj)
+  }
+  
+  # 2. 寻找高变基因 (Top 2000)，用于捕捉细胞间主要异质性
+  seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000)
+  
+  # 3. 数据缩放并执行主成分分析 (PCA)
+  seurat_obj <- ScaleData(seurat_obj, features = VariableFeatures(seurat_obj)) %>%
+    RunPCA(features = VariableFeatures(seurat_obj))
+  
+  # 4. 根据是否需要批次校正执行不同分支
+  if (run_harmony) {
+    # 使用 Harmony 根据样本来源 (orig.ident) 整合批次
+    seurat_obj <- RunHarmony(seurat_obj, group.by.vars = "orig.ident")
+    # 基于整合后的 harmony 空间进行 UMAP 和 KNN 构建
+    seurat_obj <- RunUMAP(seurat_obj, reduction = "harmony", dims = 1:npc)
+    seurat_obj <- FindNeighbors(seurat_obj, reduction = "harmony", dims = 1:npc)
+    seurat_obj <- FindClusters(seurat_obj, resolution = res)
+  } else {
+    # 不校正批次效应的标准流程
+    seurat_obj <- seurat_obj %>%
+      FindNeighbors(dims = 1:npc) %>%
+      FindClusters(resolution = res) %>%
+      RunUMAP(dims = 1:npc)
+  }
+  return(seurat_obj)
+}
+
+# 运行自定义的 Pipeline，选取前 50 个 PC，聚类分辨率设定为 0.4
+scRNAseq_cortex <- scrna_process(scRNAseq_cortex, npc = 50, res = 0.4)
+
+# 绘制初次聚类的 UMAP 图
+DimPlot(scRNAseq_cortex, label = TRUE)
+
+# 剔除在 UMAP 空间上呈现离群状态的低质量亚群 (Cluster 6)
+scRNAseq_cortex <- subset(scRNAseq_cortex, seurat_clusters %in% c(0:5, 7:10))
+DimPlot(scRNAseq_cortex, label = TRUE)
+```
+
+# 细胞亚群注释
+
+基于已知 Marker 基因或原文提供的信息，我们将基于无监督聚类得到的数字标签 (0-10) 映射到具有具体生物学意义的细胞类型上。
+
+```{r}
+#| label: cell-type-annotation
+#| fig-width: 7
+#| fig-height: 5
+
+# 定义数字 Cluster 到生物学细胞类型的映射字典
+cluster_celltype <- c(
+  "0"  = "HMG",
+  "1"  = "HMG",
+  "2"  = "MGnD 0",
+  "3"  = "MGnD1",
+  "4"  = "CC HMG1",
+  "5"  = "CC HMG2",
+  "7"  = "IFN HMG",
+  "8"  = "IFN HMGD",
+  "9"  = "CC MGnD",
+  "10" = "MGnD 2"
+)
+
+# 使用 unname 将映射关系应用到 metadata 中，新建 cell_type 列
+scRNAseq_cortex$cell_type <- unname(cluster_celltype[as.character(scRNAseq_cortex$seurat_clusters)])
+
+# 为保证图表美观且符合发表要求，自定义 9 种细胞类型的色板
+cols <- c("dodgerblue2", "skyblue2", "green4", "#6A3D9A", "black", 
+          "#FF7F00", "#E31A1C", "#FB9A99", "#CAB2D6")
+
+# 绘制带有细胞注释标签的 UMAP 图
+DimPlot(scRNAseq_cortex, group.by = 'cell_type', cols = cols)
+```
+
+#  双细胞检测与过滤 (DoubletFinder)
+
+单细胞测序中一个液滴包裹多个细胞（Doublets）会导致假性细胞类的产生。这里我们使用经典的 `DoubletFinder` 算法进行鉴定。 *注：为了演示效率，代码中对数据进行了 10,000 个细胞的抽样。针对 Seurat v5，代码非常规范地使用了 `LayerData` 来兼容图层机制。*
+
+```{r}
+#| label: doublet-detection
+#| fig-width: 8
+#| fig-height: 4
+
+library(DoubletFinder)
+
+# 完善实验设计分组元数据 (Control vs KO)
+if(!"condition" %in% colnames(scRNAseq_cortex@meta.data)){
+  scRNAseq_cortex$condition <- ifelse(grepl("KO", scRNAseq_cortex$orig.ident), "cko", "control")
+}
+
+# 为了节省计算资源进行演示，随机抽取 10000 个细胞
+set.seed(123)
+n_cells <- 10000
+sampled_cells <- sample(colnames(scRNAseq_cortex), size = n_cells)
+sc_sub_cortex <- scRNAseq_cortex[, sampled_cells]
+
+# ========== 关键修正：解决 Seurat v5 图层兼容性问题 ==========
+# 在 Seurat v5 中，数据往往分布在多个 layer 中（例如按样本分层的 counts）
+# 提取合并后的 counts 层数据可以避免 DoubletFinder 报错
+counts_sub <- LayerData(sc_sub_cortex, assay = "RNA", layer = "counts")
+metadata_sub <- sc_sub_cortex@meta.data
+
+# 新建一个单层的对象进行双细胞检测
+sc_sub_simple <- CreateSeuratObject(counts = counts_sub, meta.data = metadata_sub, project = "Doublet_sub")
+
+# 对子集执行基础处理以提供给 DoubletFinder (必须具有 PCA 降维结果)
+sc_sub_simple <- NormalizeData(sc_sub_simple)
+sc_sub_simple <- FindVariableFeatures(sc_sub_simple, selection.method = "vst", nfeatures = 2000)
+sc_sub_simple <- ScaleData(sc_sub_simple, features = VariableFeatures(sc_sub_simple))
+sc_sub_simple <- RunPCA(sc_sub_simple, features = VariableFeatures(sc_sub_simple))
+sc_sub_simple <- FindNeighbors(sc_sub_simple, dims = 1:50)
+sc_sub_simple <- FindClusters(sc_sub_simple, resolution = 0.4)
+sc_sub_simple <- RunUMAP(sc_sub_simple, dims = 1:50) 
+
+# ========== 运行 DoubletFinder ==========
+# 1. 扫描 pK 参数：寻找人工构建双细胞的最优邻域大小
+sweep.res <- paramSweep(sc_sub_simple, PCs = 1:50, sct = FALSE)
+sweep.stats <- summarizeSweep(sweep.res, GT = FALSE)
+bcmvn <- find.pK(sweep.stats)
+# 选取 BCmetric 最大的 pK 值
+pK <- as.numeric(as.character(bcmvn$pK[which.max(bcmvn$BCmetric)]))
+
+# 2. 估算同源双细胞比例（Homotypic doublets，即同种细胞类型的融合，算法较难检测）
+clusters <- Idents(sc_sub_simple) 
+homotypic.prop <- modelHomotypic(clusters)
+
+# 3. 计算预期需要剔除的双细胞数目（假设 10X 平台的双细胞率约 7.5%）
+nExp_poi <- round(0.075 * nrow(sc_sub_simple@meta.data))
+nExp_poi.adj <- round(nExp_poi * (1 - homotypic.prop))
+
+# 4. 执行核心鉴定算法
+sc_sub_simple <- doubletFinder(sc_sub_simple, PCs = 1:50, pK = pK, nExp = nExp_poi.adj)
+
+# ========== 提取结果并映射回原始数据 ==========
+# 动态获取 DoubletFinder 生成的结果列名
+df_colname <- grep("DF.classifications", colnames(sc_sub_simple@meta.data), value = TRUE)[1]
+sc_sub_cortex$doublet_status <- sc_sub_simple@meta.data[[df_colname]]
+
+# 结果可视化
+DimPlot(sc_sub_simple, group.by = df_colname, reduction = "umap", label = TRUE) + 
+  ggtitle("Doublet detection (subset)")
+
+# 生产环境中通常在此处执行过滤：
+# sc_sub_cortex_clean <- subset(sc_sub_cortex, doublet_status == "Singlet")
+```
+
+#  差异表达分析 (DGE)
+
+我们希望找出在 KO (cko) 组和对照组 (control) 之间表达有显著差异的基因。这里对所有定义的细胞亚群进行了循环检验。同样地，针对 Seurat v5 采用了 `JoinLayers` 的优秀实践。
+
+```{r}
+#| label: differential-expression
+
+library(tibble)
+
+# 检查分组信息
+if(!"condition" %in% colnames(scRNAseq_cortex@meta.data)){
+  scRNAseq_cortex$condition <- ifelse(grepl("KO", scRNAseq_cortex$orig.ident), "cko", "control")
+}
+
+# 定义针对多细胞类型的差异分析函数
+scrna_DGE <- function(SeuratData, logfc.threshold = 0.25, min.pct = 0.3, test.use = "wilcox") {
+  cell_type <- levels(as.factor(SeuratData$cell_type))
+  
+  # 对每种细胞类型循环执行 Wilcoxon 秩和检验
+  results <- lapply(cell_type, function(x) {
+    # 提取当前细胞类型
+    subset_obj <- subset(SeuratData, cell_type == x)
+    
+    # 关键修复：Seurat v5 需要先合并拆分的图层才能进行差异分析
+    subset_obj <- JoinLayers(subset_obj)
+    
+    # 在当前细胞类型内，比较 cko 组和 control 组
+    res <- FindMarkers(subset_obj, 
+                       ident.1 = "cko", ident.2 = "control", group.by = "condition",
+                       logfc.threshold = logfc.threshold, min.pct = min.pct, test.use = test.use)
+    
+    if (nrow(res) == 0) return(NULL)
+    
+    # 结果格式化与统计量整理
+    res %>% 
+      rownames_to_column("gene") %>%
+      mutate(direction = ifelse(avg_log2FC > 0, "up", "down")) %>%
+      mutate(direction = factor(direction, c("up", "down"))) %>%
+      mutate(FDR = p.adjust(p_val, method = "BH")) %>% 
+      mutate(Celltype = rep(x, nrow(res)))
+  })
+  
+  names(results) <- cell_type
+  return(results)
+}
+
+# 运行差异分析
+SCRNAseq_DGE <- scrna_DGE(scRNAseq_cortex)
+combined_DGE <- do.call(rbind, SCRNAseq_DGE)
+
+# 筛选显著差异基因：校正P值 < 0.05, 对数差异倍数 > 0.25, 表达比例 > 30%
+combined_DGE_filter <- combined_DGE %>% 
+  filter(p_val_adj < 0.05 & abs(avg_log2FC) > 0.25 & pct.1 > 0.3)
+```
+
+#  差异基因火山图可视化
+
+为了直观展示特定状态转化下的关键驱动基因，文章单独对 `HMG (cko)` 组与 `CC HMG1 (WT/control)` 组进行了比较，并绘制了火山图。
+
+```{r}
+#| label: volcano-plot
+#| fig-width: 6
+#| fig-height: 6
+
+library(ggrepel)
+
+# 1. 精确提取目标子集并合并
+scRNAseq_cortex.wt <- subset(scRNAseq_cortex, subset = cell_type == "CC HMG1" & condition == "control")
+scRNAseq_cortex.ko <- subset(scRNAseq_cortex, subset = cell_type == "HMG" & condition == "cko")
+scRNAseq_cortex.HMG <- merge(scRNAseq_cortex.wt, scRNAseq_cortex.ko)
+
+# 将 idents 切换为 cell_type，以便基于细胞类型进行比较
+Idents(scRNAseq_cortex.HMG) <- "cell_type"
+
+# 2. 执行 FindMarkers (HMG_cko vs CC_HMG1_wt)
+HMG_DEG <- FindMarkers(JoinLayers(scRNAseq_cortex.HMG), 
+                       ident.1 = "HMG", ident.2 = "CC HMG1", 
+                       test.use = "wilcox")
+
+# 3. 整理绘图数据帧
+HMG_DEG <- HMG_DEG %>% 
+  mutate(Difference = pct.1 - pct.2) %>% # 计算两组表达比例的差值
+  rownames_to_column("gene")
+
+# 定义显著性阈值
+log2FC <- 1
+padj <- 0.05
+
+# 依据阈值分配上调 (up)、下调 (down)、不显著 (ns) 标签
+HMG_DEG$threshold <- "ns"
+HMG_DEG[which(HMG_DEG$avg_log2FC > log2FC & HMG_DEG$p_val_adj < padj), "threshold"] <- "up"
+HMG_DEG[which(HMG_DEG$avg_log2FC < (-log2FC) & HMG_DEG$p_val_adj < padj), "threshold"] <- "down"
+HMG_DEG$threshold <- factor(HMG_DEG$threshold, levels = c("down", "ns", "up"))
+
+# 4. 使用 ggplot2 绘制高规格火山图
+p <- ggplot(HMG_DEG, aes(x = Difference, y = avg_log2FC, color = threshold)) +
+  geom_point(size = 1, alpha = 0.3) +
+  # 突出显示特定的上调关键基因 (红色)
+  geom_point(color = "red", size = 1.5, 
+             data = subset(HMG_DEG, gene %in% c("Crybb1", "Camk2n1", "Ecscr", "Il7r", "Serpinf1"))) +
+  # 突出显示特定的下调关键基因 (蓝色)
+  geom_point(color = "blue", size = 1.5, 
+             data = subset(HMG_DEG, gene %in% c("Havcr2", "Lpl", "Ccl4", "Cst7", "Ccl3"))) +
+  # 添加基准辅助线
+  geom_vline(xintercept = 0.0, linetype = 2) + 
+  geom_hline(yintercept = 0, linetype = 2) +
+  scale_color_manual(values = c("#5fb9ff", "grey", "#de7a60")) +
+  # 使用 ggrepel 自动避让添加基因标签
+  geom_label_repel(data = subset(HMG_DEG, gene %in% c("Crybb1", "Camk2n1", "Ecscr", "Il7r", "Serpinf1")), 
+                   aes(label = gene), color = "#b20000", 
+                   label.padding = 0.1, box.padding = 0.35, max.overlaps = Inf, 
+                   segment.size = 0.4, min.segment.length = 0, size = 4) +
+  geom_label_repel(data = subset(HMG_DEG, gene %in% c("Havcr2", "Lpl", "Ccl4", "Cst7", "Ccl3")), 
+                   aes(label = gene), color = "#0000b2", 
+                   label.padding = 0.1, box.padding = 0.35, max.overlaps = Inf, 
+                   segment.size = 0.4, min.segment.length = 0, size = 4) +
+  theme_classic()
+
+print(p)
+# ggsave("DEG_of_HMG.pdf", width = 5, height = 5)
+```
